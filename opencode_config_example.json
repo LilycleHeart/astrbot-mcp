@@ -1,0 +1,14 @@
+{
+  "mcp": {
+    "servers": {
+      "astrbot": {
+        "command": "python",
+        "args": ["D:\\opencode\\随便玩玩\\astrbot-mcp\\server.py"],
+        "env": {
+          "ASTRBOT_SSH_PASSWORD": "你的SSH密码",
+          "ASTRBOT_PATH": "~/astrbot"
+        }
+      }
+    }
+  }
+}
