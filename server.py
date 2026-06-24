@@ -1,6 +1,7 @@
 """
 AstrBot MCP Server
 用于连接远程 AstrBot 服务器，查看日志和实时调试
+支持 proot Ubuntu 环境
 """
 
 import asyncio
@@ -24,9 +25,26 @@ SERVER_CONFIG = {
     "host": "192.168.50.71",
     "port": 8022,
     "username": "u0_a275",
-    "password": os.getenv("ASTRBOT_SSH_PASSWORD", "kyoko"),  # 从环境变量读取密码
-    "astrbot_path": "/data/data/com.termux/files/home/AstrBot",  # AstrBot 安装路径
+    "password": os.getenv("ASTRBOT_SSH_PASSWORD", "kyoko"),
+    # proot 环境配置
+    "proot_root": "/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/ubuntu-22.04",
+    "astrbot_path": "/root/AstrBot",  # proot 环境中的路径
 }
+
+
+def proot_command(cmd: str) -> str:
+    """包装命令为 proot 命令"""
+    proot_base = (
+        f'unset LD_PRELOAD && proot -0 -r {SERVER_CONFIG["proot_root"]} '
+        f'-w /root '
+        f'-b {SERVER_CONFIG["proot_root"]}/sys/.empty:/sys/fs/selinux '
+        f'-b /proc -b /sys -b /data/data/com.termux/files/home/proot_shm:/dev/shm -b /dev '
+        f'--sysvipc --link2symlink --kill-on-exit '
+        f'/usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin '
+        f'TERM=dumb HOME=/root USER=root '
+        f'/bin/bash -c "{cmd}"'
+    )
+    return proot_base
 
 
 class AstrBotMCPServer:
@@ -51,11 +69,13 @@ class AstrBotMCPServer:
             )
         return self.ssh_client
     
-    def _execute_command(self, command: str) -> tuple[str, str, int]:
+    def _execute_command(self, command: str, use_proot: bool = False) -> tuple[str, str, int]:
         """执行远程命令"""
         try:
             client = self._get_ssh_client()
-            stdin, stdout, stderr = client.exec_command(command)
+            if use_proot:
+                command = proot_command(command)
+            stdin, stdout, stderr = client.exec_command(command, timeout=60)
             exit_code = stdout.channel.recv_exit_status()
             return stdout.read().decode('utf-8', errors='replace'), stderr.read().decode('utf-8', errors='replace'), exit_code
         except Exception as e:
@@ -173,6 +193,11 @@ class AstrBotMCPServer:
                             "command": {
                                 "type": "string",
                                 "description": "要执行的命令"
+                            },
+                            "use_proot": {
+                                "type": "boolean",
+                                "description": "是否在 proot 环境中执行，默认 true",
+                                "default": True
                             }
                         },
                         "required": ["command"]
@@ -225,7 +250,8 @@ class AstrBotMCPServer:
                     )
                 elif name == "astrbot_execute":
                     return await self._execute(
-                        command=arguments["command"]
+                        command=arguments["command"],
+                        use_proot=arguments.get("use_proot", True)
                     )
                 elif name == "astrbot_check_errors":
                     return await self._check_errors(
@@ -243,18 +269,18 @@ class AstrBotMCPServer:
             "ps aux | grep -i astrbot | grep -v grep"
         )
         
-        if "astrbot" in stdout.lower():
+        if "astrbot" in stdout.lower() or "wrapper" in stdout.lower():
             status = "运行中"
             # 获取进程信息
             lines = stdout.strip().split('\n')
-            process_info = lines[0] if lines else ""
+            process_info = '\n'.join(lines[:3]) if lines else ""
         else:
             status = "未运行"
             process_info = ""
         
-        # 获取系统信息
-        uptime_out, _, _ = self._execute_command("uptime")
-        memory_out, _, _ = self._execute_command("free -h | head -2")
+        # 获取系统信息（在 proot 环境中）
+        uptime_out, _, _ = self._execute_command("uptime", use_proot=True)
+        memory_out, _, _ = self._execute_command("free -h | head -2", use_proot=True)
         
         result = f"""AstrBot 状态: {status}
 
@@ -271,19 +297,29 @@ class AstrBotMCPServer:
     
     async def _get_logs(self, lines: int = 50, filter_text: str = "") -> list[TextContent]:
         """获取 AstrBot 日志"""
-        log_path = f"{SERVER_CONFIG['astrbot_path']}/data/*.log"
+        log_path = f"{SERVER_CONFIG['astrbot_path']}/data/astrbot.log"
         
         if filter_text:
-            command = f"tail -n {lines} {log_path} | grep -i '{filter_text}'"
+            command = f"tail -n {lines} {log_path} 2>/dev/null | grep -i '{filter_text}' || echo '日志为空或不存在'"
         else:
-            command = f"tail -n {lines} {log_path}"
+            command = f"tail -n {lines} {log_path} 2>/dev/null || echo '日志为空或不存在'"
         
-        stdout, stderr, exit_code = self._execute_command(command)
+        stdout, stderr, exit_code = self._execute_command(command, use_proot=True)
         
-        if exit_code != 0:
+        if not stdout or stdout.strip() == "日志为空或不存在":
             # 尝试其他日志路径
-            command = f"find {SERVER_CONFIG['astrbot_path']} -name '*.log' -exec tail -n {lines} {{}} \\;"
-            stdout, stderr, exit_code = self._execute_command(command)
+            command = f"find {SERVER_CONFIG['astrbot_path']}/data -name '*.log' -type f 2>/dev/null"
+            stdout, stderr, exit_code = self._execute_command(command, use_proot=True)
+            
+            if stdout:
+                log_files = stdout.strip().split('\n')
+                if log_files:
+                    log_path = log_files[0]
+                    if filter_text:
+                        command = f"tail -n {lines} {log_path} | grep -i '{filter_text}'"
+                    else:
+                        command = f"tail -n {lines} {log_path}"
+                    stdout, stderr, exit_code = self._execute_command(command, use_proot=True)
         
         if not stdout:
             return [TextContent(type="text", text="未找到日志文件或日志为空")]
@@ -292,14 +328,14 @@ class AstrBotMCPServer:
     
     async def _get_logs_realtime(self, duration: int = 30, filter_text: str = "") -> list[TextContent]:
         """实时监控 AstrBot 日志"""
-        log_path = f"{SERVER_CONFIG['astrbot_path']}/data/*.log"
+        log_path = f"{SERVER_CONFIG['astrbot_path']}/data/astrbot.log"
         
         if filter_text:
-            command = f"timeout {duration} tail -f {log_path} | grep --line-buffered -i '{filter_text}'"
+            command = f"timeout {duration} tail -f {log_path} 2>/dev/null | grep --line-buffered -i '{filter_text}'"
         else:
-            command = f"timeout {duration} tail -f {log_path}"
+            command = f"timeout {duration} tail -f {log_path} 2>/dev/null"
         
-        stdout, stderr, exit_code = self._execute_command(command)
+        stdout, stderr, exit_code = self._execute_command(command, use_proot=True)
         
         if not stdout:
             return [TextContent(type="text", text=f"监控 {duration} 秒，未捕获到日志")]
@@ -308,32 +344,34 @@ class AstrBotMCPServer:
     
     async def _restart(self) -> list[TextContent]:
         """重启 AstrBot 服务"""
-        # 尝试使用 systemd
-        stdout, stderr, exit_code = self._execute_command("systemctl restart astrbot")
+        # 杀掉现有进程
+        self._execute_command("pkill -f wrapper_astrbot")
+        self._execute_command("pkill -f 'python.*main.py'")
+        await asyncio.sleep(2)
         
-        if exit_code != 0:
-            # 尝试使用 pm2
-            stdout, stderr, exit_code = self._execute_command("pm2 restart astrbot")
+        # 重新启动
+        stdout, stderr, exit_code = self._execute_command(
+            "nohup /data/data/com.termux/files/home/wrapper_astrbot.sh &"
+        )
         
-        if exit_code != 0:
-            # 尝试直接杀进程并重启
-            self._execute_command("pkill -f astrbot")
-            await asyncio.sleep(2)
-            stdout, stderr, exit_code = self._execute_command(
-                f"cd {SERVER_CONFIG['astrbot_path']} && python main.py &"
-            )
+        await asyncio.sleep(3)
         
-        if exit_code == 0:
+        # 检查是否启动成功
+        stdout, stderr, exit_code = self._execute_command(
+            "ps aux | grep -i astrbot | grep -v grep"
+        )
+        
+        if "wrapper" in stdout.lower() or "astrbot" in stdout.lower():
             return [TextContent(type="text", text="AstrBot 重启成功")]
         else:
-            return [TextContent(type="text", text=f"重启失败: {stderr}")]
+            return [TextContent(type="text", text=f"重启可能失败，请手动检查")]
     
     async def _get_config(self, config_file: str = "cmd_config.json") -> list[TextContent]:
         """查看 AstrBot 配置"""
         config_path = f"{SERVER_CONFIG['astrbot_path']}/data/{config_file}"
         command = f"cat {config_path}"
         
-        stdout, stderr, exit_code = self._execute_command(command)
+        stdout, stderr, exit_code = self._execute_command(command, use_proot=True)
         
         if exit_code != 0:
             return [TextContent(type="text", text=f"无法读取配置文件: {stderr}")]
@@ -351,7 +389,7 @@ class AstrBotMCPServer:
         plugins_path = f"{SERVER_CONFIG['astrbot_path']}/data/plugins"
         command = f"ls -la {plugins_path}/"
         
-        stdout, stderr, exit_code = self._execute_command(command)
+        stdout, stderr, exit_code = self._execute_command(command, use_proot=True)
         
         if exit_code != 0:
             return [TextContent(type="text", text=f"无法列出插件: {stderr}")]
@@ -363,7 +401,7 @@ class AstrBotMCPServer:
         config_path = f"{SERVER_CONFIG['astrbot_path']}/data/config/{plugin_name}_config.json"
         command = f"cat {config_path}"
         
-        stdout, stderr, exit_code = self._execute_command(command)
+        stdout, stderr, exit_code = self._execute_command(command, use_proot=True)
         
         if exit_code != 0:
             return [TextContent(type="text", text=f"无法读取插件配置: {stderr}")]
@@ -375,9 +413,9 @@ class AstrBotMCPServer:
         except:
             return [TextContent(type="text", text=f"插件 {plugin_name} 的配置:\n\n{stdout}")]
     
-    async def _execute(self, command: str) -> list[TextContent]:
+    async def _execute(self, command: str, use_proot: bool = True) -> list[TextContent]:
         """执行远程命令"""
-        stdout, stderr, exit_code = self._execute_command(command)
+        stdout, stderr, exit_code = self._execute_command(command, use_proot=use_proot)
         
         result = f"命令: {command}\n退出码: {exit_code}\n\n"
         
@@ -391,10 +429,10 @@ class AstrBotMCPServer:
     
     async def _check_errors(self, lines: int = 200) -> list[TextContent]:
         """检查 AstrBot 最近的错误日志"""
-        log_path = f"{SERVER_CONFIG['astrbot_path']}/data/*.log"
-        command = f"tail -n {lines} {log_path} | grep -i -E '(error|exception|traceback|failed|失败|错误)'"
+        log_path = f"{SERVER_CONFIG['astrbot_path']}/data/astrbot.log"
+        command = f"tail -n {lines} {log_path} 2>/dev/null | grep -i -E '(error|exception|traceback|failed|失败|错误)'"
         
-        stdout, stderr, exit_code = self._execute_command(command)
+        stdout, stderr, exit_code = self._execute_command(command, use_proot=True)
         
         if not stdout:
             return [TextContent(type="text", text="未发现错误日志")]
